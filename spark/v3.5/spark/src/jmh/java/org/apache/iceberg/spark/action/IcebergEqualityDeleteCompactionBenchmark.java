@@ -73,6 +73,15 @@ import org.openjdk.jmh.annotations.Timeout;
  * <p>Run with: {@code ./gradlew :iceberg-spark:iceberg-spark-3.5_2.12:jmh
  * -PjmhIncludeRegex=IcebergEqualityDeleteCompactionBenchmark
  * -PjmhOutputPath=benchmark/eq-delete-compaction.txt}
+ *
+ * <p>On JDK 17+, the {@code jmh} task's forked JVM needs the same {@code --add-opens} flags that
+ * {@code build.gradle}'s {@code extraJvmArgs} applies to ordinary {@code Test} tasks (for example
+ * {@code java.base/sun.nio.ch}), or Spark fails to start with {@code IllegalAccessError}. The
+ * {@code jmh} task does not apply {@code extraJvmArgs} to its fork, so pass the same flags through
+ * the {@code JDK_JAVA_OPTIONS} environment variable (not {@code JAVA_TOOL_OPTIONS}, which this JDK
+ * rejects for {@code --add-opens}) when running this benchmark, e.g. {@code JDK_JAVA_OPTIONS="
+ * --add-opens java.base/sun.nio.ch=ALL-UNNAMED ..." ./gradlew ... jmh ...} with every entry from
+ * {@code extraJvmArgs}.
  */
 @Fork(1)
 @State(Scope.Benchmark)
