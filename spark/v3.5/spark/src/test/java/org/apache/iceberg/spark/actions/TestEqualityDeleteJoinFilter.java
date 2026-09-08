@@ -33,6 +33,7 @@ import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.struct;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.tasksByLocation;
 import static org.apache.spark.sql.functions.input_file_name;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.util.List;
@@ -346,11 +347,42 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     }
   }
 
+  @Test
+  public void rowsFromAFileWithoutRewriteAttributesFailTheRewrite() {
+    Table table = unpartitionedTable();
+    DataFile planned = appendRows(table, null, record(SCHEMA, 1, "a", "x")); // seq 1
+    DataFile unplanned = appendRows(table, null, record(SCHEMA, 2, "b", "x")); // seq 2
+    addEqualityDeletes(table, null, "id", 1, 2); // seq 3
+
+    Map<String, FileScanTask> tasks = tasksByLocation(table);
+    // the group plans one file while the read is staged with both, as a divergence between
+    // planning and reading would cause
+    RewriteFileGroup group = group(1, ImmutableList.of(tasks.get(planned.location())));
+    EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
+
+    try (EqualityDeleteCacheManager caches =
+        new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
+      Dataset<Row> survivors =
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
+              .filter(
+                  readWithoutEqualityDeletes(table, Lists.newArrayList(tasks.values())),
+                  plan.joinInfo(1));
+
+      assertThatThrownBy(survivors::collectAsList)
+          .hasStackTraceContaining("Cannot find rewrite attributes for source file")
+          .hasStackTraceContaining(unplanned.location());
+    }
+  }
+
   private Dataset<Row> readWithoutEqualityDeletes(Table table, RewriteFileGroup group) {
+    return readWithoutEqualityDeletes(table, group.fileScanTasks());
+  }
+
+  private Dataset<Row> readWithoutEqualityDeletes(Table table, List<FileScanTask> groupTasks) {
     this.stagedTable = table;
     this.stagingId = UUID.randomUUID().toString();
     List<FileScanTask> tasks =
-        group.fileScanTasks().stream()
+        groupTasks.stream()
             .map(EqualityDeleteScans::withoutEqualityDeletes)
             .collect(Collectors.toList());
     SparkTableCache.get().add(stagingId, table);

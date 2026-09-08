@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.actions;
 import static org.apache.spark.sql.functions.broadcast;
 
 import java.util.List;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.spark.actions.EqualityDeleteJoinPlan.GroupJoinInfo;
 import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
@@ -30,13 +31,14 @@ import org.apache.spark.sql.Row;
  * Applies a file group's equality deletes to data rows with sequence-aware joins.
  *
  * <p>The input rows carry {@link EqualityDeleteScans#FILE_COLUMN}, the location of the data file
- * each row was read from, produced with {@code input_file_name()}. A broadcast join attaches each
- * data file's sequence number and partition scope ID, then every merged delete DataFrame is
- * left-outer joined with null-safe key equality (plus scope equality for partition-scoped deletes).
- * A row survives a join unless {@code data_sequence_number < latest_delete_sequence_number}. Rows
- * must survive every join to be written. Key expressions come from {@link EqualityKeyPath}, so a
- * key nested in structs is compared as the reader-local {@code StructProjection} compares it: a
- * null parent struct matches only a null parent struct.
+ * each row was read from, produced with {@code input_file_name()}. A left-outer broadcast join
+ * attaches each data file's sequence number and partition scope ID, and a row read from a file the
+ * group did not plan fails the rewrite instead of being silently dropped. Every merged delete
+ * DataFrame is then left-outer joined with null-safe key equality (plus scope equality for
+ * partition-scoped deletes). A row survives a join unless {@code data_sequence_number <
+ * latest_delete_sequence_number}. Rows must survive every join to be written. Key expressions come
+ * from {@link EqualityKeyPath}, so a key nested in structs is compared as the reader-local {@code
+ * StructProjection} compares it: a null parent struct matches only a null parent struct.
  *
  * <p>Only the join helper columns ({@code __rewrite_*}) are removed from the result, so it keeps
  * every other column of the input rows: the table columns plus any metadata columns the staged read
@@ -61,6 +63,12 @@ class EqualityDeleteJoinFilter {
    *     any metadata columns the staged read exposes (row lineage on v3+)
    */
   Dataset<Row> filter(Dataset<Row> dataRows, GroupJoinInfo info) {
+    // every join below reads the checked sequence number, which is what keeps the guard against
+    // unmatched source files in the plan Spark executes
+    Preconditions.checkArgument(
+        !info.cacheKeys().isEmpty(),
+        "Cannot apply the equality-delete join path to a file group without equality deletes");
+
     Dataset<Row> attributes = scans.fileAttributes(info.dataFiles());
     Dataset<Row> rows =
         dataRows
@@ -69,7 +77,10 @@ class EqualityDeleteJoinFilter {
                 dataRows
                     .col(EqualityDeleteScans.FILE_COLUMN)
                     .equalTo(attributes.col(EqualityDeleteScans.LOCATION_COLUMN)),
-                "inner")
+                "left_outer")
+            .withColumn(
+                EqualityDeleteScans.SEQUENCE_NUMBER_COLUMN,
+                EqualityDeleteScans.checkedSequenceNumber())
             .drop(EqualityDeleteScans.LOCATION_COLUMN);
 
     for (DeleteCacheKey key : info.partitionScopedKeys()) {

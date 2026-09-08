@@ -20,8 +20,12 @@ package org.apache.iceberg.spark.actions;
 
 import static org.apache.spark.sql.functions.broadcast;
 import static org.apache.spark.sql.functions.col;
+import static org.apache.spark.sql.functions.concat;
 import static org.apache.spark.sql.functions.input_file_name;
+import static org.apache.spark.sql.functions.lit;
 import static org.apache.spark.sql.functions.max;
+import static org.apache.spark.sql.functions.raise_error;
+import static org.apache.spark.sql.functions.when;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -173,6 +177,24 @@ class EqualityDeleteScans {
   }
 
   /**
+   * Data sequence number of the row's source file, raising a clear error when the broadcast
+   * attribute join found no attributes for that file.
+   *
+   * <p>Both attribute joins are left outer joins guarded by this column so that any divergence
+   * between the planned files and the files actually scanned fails the rewrite instead of silently
+   * dropping data rows or silently leaving deletes unapplied. Callers must keep the column in the
+   * plan they execute, which every join does: the merged deletes aggregate it and the data-side
+   * filter compares it to the latest delete sequence number.
+   */
+  static Column checkedSequenceNumber() {
+    return when(
+            col(LOCATION_COLUMN).isNull(),
+            raise_error(
+                concat(lit("Cannot find rewrite attributes for source file "), col(FILE_COLUMN))))
+        .otherwise(col(SEQUENCE_NUMBER_COLUMN));
+  }
+
+  /**
    * Reads every delete file of the key once and merges the rows by equality key (and partition
    * scope for partition-scoped keys), keeping the latest delete sequence number per key.
    *
@@ -215,7 +237,7 @@ class EqualityDeleteScans {
         deleteRows.join(
             broadcast(attributes),
             deleteRows.col(FILE_COLUMN).equalTo(attributes.col(LOCATION_COLUMN)),
-            "inner");
+            "left_outer");
 
     List<Column> groupingColumns = Lists.newArrayList();
     for (int pos = 0; pos < keyPaths.size(); pos++) {
@@ -227,6 +249,6 @@ class EqualityDeleteScans {
 
     return tagged
         .groupBy(groupingColumns.toArray(new Column[0]))
-        .agg(max(col(SEQUENCE_NUMBER_COLUMN)).as(DELETE_SEQUENCE_NUMBER_COLUMN));
+        .agg(max(checkedSequenceNumber()).as(DELETE_SEQUENCE_NUMBER_COLUMN));
   }
 }
