@@ -156,8 +156,9 @@ abstract class SparkDataFileRewriteRunner
 
   /**
    * Reads the staged file group. On the merge/join path the rows are read with equality deletes
-   * removed from the scan tasks and filtered against the merged equality-delete DataFrames; the
-   * result has exactly the table columns.
+   * removed from the scan tasks, tagged with the location of the data file they came from, and
+   * filtered against the merged equality-delete DataFrames; the result has exactly the table
+   * columns.
    */
   Dataset<Row> readGroup(String groupId, RewriteFileGroup group, Map<String, String> readOptions) {
     Dataset<Row> rows =

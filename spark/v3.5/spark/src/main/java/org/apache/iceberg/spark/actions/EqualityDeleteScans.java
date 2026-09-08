@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.actions;
 
 import static org.apache.spark.sql.functions.broadcast;
 import static org.apache.spark.sql.functions.col;
+import static org.apache.spark.sql.functions.input_file_name;
 import static org.apache.spark.sql.functions.max;
 
 import java.util.List;
@@ -31,7 +32,6 @@ import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.SchemaParser;
@@ -60,11 +60,18 @@ import org.apache.spark.sql.types.StructType;
  * the scan tasks. Equality delete files are read through the same staged scan by presenting each
  * delete file as a data file. Key columns are {@link EqualityKeyPath} expressions resolved by field
  * ID, so keys nested in structs are compared as the reader-local path compares them. Both reads
- * expose the {@code _file} metadata column, which a broadcast join uses to attach the data sequence
- * number and the partition scope of every file.
+ * identify the source file of every row in {@link #FILE_COLUMN}, which a broadcast join uses to
+ * attach the data sequence number and the partition scope of that file.
+ *
+ * <p>The file location comes from {@code input_file_name()}, not from the {@code _file} metadata
+ * column: a staged rewrite read of a row-lineage table already carries {@code _row_id} and {@code
+ * _last_updated_sequence_number} in its output marked as metadata columns, and Spark then exposes
+ * only those as the relation's metadata output, so {@code _file} cannot be resolved at all. The
+ * Iceberg readers set the value from {@code task.file().location()}, which is exactly what {@link
+ * #fileAttributes} keys on, and the projection that reads it sits directly above the scan.
  */
 class EqualityDeleteScans {
-  static final String FILE_COLUMN = MetadataColumns.FILE_PATH.name();
+  static final String FILE_COLUMN = "__rewrite_file_path";
   static final String LOCATION_COLUMN = "__rewrite_file_location";
   static final String SEQUENCE_NUMBER_COLUMN = "__rewrite_data_sequence_number";
   static final String SCOPE_COLUMN = "__rewrite_scope_key";
@@ -159,6 +166,12 @@ class EqualityDeleteScans {
    * Reads every delete file of the key once and merges the rows by equality key (and partition
    * scope for partition-scoped keys), keeping the latest delete sequence number per key.
    *
+   * <p>Each delete row is tagged with the delete file it came from through {@code
+   * input_file_name()}, which the Iceberg readers set from {@code task.file().location()} and which
+   * is evaluated in the projection directly above the scan. The {@code _file} metadata column
+   * cannot be used here because a staged rewrite read of a row-lineage table exposes only its
+   * lineage columns as metadata output.
+   *
    * <p>The delete file scan tasks are staged under {@code stagingId}; the caller must remove that
    * ID from {@link SparkTableCache} and {@link ScanTaskSetManager} once the DataFrame is released.
    */
@@ -183,7 +196,7 @@ class EqualityDeleteScans {
     for (int pos = 0; pos < keyPaths.size(); pos++) {
       projection.add(keyPaths.get(pos).column(staged::col).as(DELETE_KEY_PREFIX + pos));
     }
-    projection.add(col(FILE_COLUMN));
+    projection.add(input_file_name().as(FILE_COLUMN));
 
     Dataset<Row> deleteRows = staged.select(projection.toArray(new Column[0]));
 

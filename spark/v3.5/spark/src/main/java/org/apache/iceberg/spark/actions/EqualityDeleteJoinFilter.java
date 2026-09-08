@@ -29,8 +29,9 @@ import org.apache.spark.sql.Row;
 /**
  * Applies a file group's equality deletes to data rows with sequence-aware joins.
  *
- * <p>The input rows carry the {@code _file} metadata column. A broadcast join attaches each data
- * file's sequence number and partition scope, then every merged delete DataFrame is left-outer
+ * <p>The input rows carry {@link EqualityDeleteScans#FILE_COLUMN}, the location of the data file
+ * each row was read from, produced with {@code input_file_name()}. A broadcast join attaches each
+ * data file's sequence number and partition scope, then every merged delete DataFrame is left-outer
  * joined with null-safe key equality (plus scope equality for partition-scoped deletes). A row
  * survives a join unless {@code data_sequence_number < latest_delete_sequence_number}. Rows must
  * survive every join to be written. Key expressions come from {@link EqualityKeyPath}, so a key
@@ -47,7 +48,8 @@ class EqualityDeleteJoinFilter {
   }
 
   /**
-   * @param dataRows table columns plus {@code _file}, read with equality deletes removed
+   * @param dataRows table columns plus {@link EqualityDeleteScans#FILE_COLUMN}, read with equality
+   *     deletes removed
    * @param info join information of the file group
    * @return the surviving rows with exactly the table columns
    */

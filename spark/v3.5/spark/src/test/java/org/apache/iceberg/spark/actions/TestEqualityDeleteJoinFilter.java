@@ -31,6 +31,7 @@ import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.partition;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.record;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.struct;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.tasksByLocation;
+import static org.apache.spark.sql.functions.input_file_name;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.File;
@@ -334,7 +335,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
         .format("iceberg")
         .option(SparkReadOptions.SCAN_TASK_SET_ID, stagingId)
         .load(stagingId)
-        .selectExpr("*", EqualityDeleteScans.FILE_COLUMN);
+        .withColumn(EqualityDeleteScans.FILE_COLUMN, input_file_name());
   }
 
   private static List<FileScanTask> allTasks(Table table) {
