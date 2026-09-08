@@ -27,11 +27,14 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.LongStream;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.EnvironmentContext;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Files;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.PartitionStatisticsFile;
@@ -43,10 +46,14 @@ import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.FileHelpers;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.NamedReference;
 import org.apache.iceberg.expressions.Zorder;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -235,6 +242,73 @@ public class TestRewriteDataFilesProcedure extends ExtensionsTestBase {
 
     List<Object[]> actualRecords = currentData();
     assertEquals("Data should not change", expectedRecords, actualRecords);
+  }
+
+  @TestTemplate
+  public void testRewriteDataFilesWithEqualityDeleteJoin() throws IOException {
+    sql(
+        "CREATE TABLE %s (c1 int, c2 string, c3 string) USING iceberg TBLPROPERTIES('format-version' = '2')",
+        tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 'a', 'x'), (2, 'b', 'x')", tableName);
+    sql("INSERT INTO TABLE %s VALUES (3, 'c', 'y')", tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    Schema deleteRowSchema = table.schema().select("c1");
+    Record delete = GenericRecord.create(deleteRowSchema);
+    delete.setField("c1", 1);
+    OutputFile out =
+        table
+            .io()
+            .newOutputFile(
+                table
+                    .locationProvider()
+                    .newDataLocation(
+                        FileFormat.PARQUET.addExtension(UUID.randomUUID().toString())));
+    DeleteFile deleteFile =
+        FileHelpers.writeDeleteFile(table, out, null, ImmutableList.of(delete), deleteRowSchema);
+    table.newRowDelta().addDeletes(deleteFile).commit();
+    sql("REFRESH TABLE %s", tableName);
+
+    List<Object[]> expectedRecords = currentData();
+    assertThat(expectedRecords).hasSize(2);
+
+    // the two VALUES-based inserts above produce 3 data files under this test's Spark
+    // configuration (AQE disabled in setupSpark()), not one per statement; confirm that before
+    // asserting on the rewrite counts below
+    List<Object[]> dataFileCount =
+        sql("SELECT count(*) FROM %s.files WHERE content = 0", tableName);
+    assertThat(dataFileCount.get(0)[0]).isEqualTo(3L);
+
+    List<Object[]> output =
+        sql(
+            "CALL %s.system.rewrite_data_files(table => '%s', "
+                + "options => map('rewrite-all', 'true', 'eq-delete-join-threshold-records', '0', "
+                + "'eq-delete-join-cache-storage-level', 'DISK_ONLY', 'remove-dangling-deletes', 'true'))",
+            catalogName, tableIdent);
+
+    assertEquals(
+        "Action should rewrite 3 data files and add 1 data file",
+        row(3, 1),
+        Arrays.copyOf(output.get(0), 2));
+    assertEquals("Data after compaction should not change", expectedRecords, currentData());
+    assertThat(spark.sharedState().cacheManager().isEmpty())
+        .as("Merged equality-delete DataFrames must be released")
+        .isTrue();
+  }
+
+  @TestTemplate
+  public void testRewriteDataFilesWithInvalidEqualityDeleteJoinStorageLevel() {
+    createTable();
+    insertData(2);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.rewrite_data_files(table => '%s', "
+                        + "options => map('eq-delete-join-cache-storage-level', 'BOGUS'))",
+                    catalogName, tableIdent))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot parse 'eq-delete-join-cache-storage-level' value BOGUS");
   }
 
   @TestTemplate
