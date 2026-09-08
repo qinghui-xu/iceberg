@@ -18,9 +18,11 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import java.util.Map;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.spark.sql.Dataset;
@@ -41,14 +43,19 @@ class SparkBinPackFileRewriteRunner extends SparkDataFileRewriteRunner {
   @Override
   protected void doRewrite(String groupId, RewriteFileGroup group) {
     // read the files packing them into splits of the required size
-    Dataset<Row> scanDF =
-        spark()
-            .read()
-            .format("iceberg")
-            .option(SparkReadOptions.SCAN_TASK_SET_ID, groupId)
-            .option(SparkReadOptions.SPLIT_SIZE, group.inputSplitSize())
-            .option(SparkReadOptions.FILE_OPEN_COST, "0")
-            .load(groupId);
+    Map<String, String> readOptions =
+        ImmutableMap.of(
+            SparkReadOptions.SPLIT_SIZE,
+            String.valueOf(group.inputSplitSize()),
+            SparkReadOptions.FILE_OPEN_COST,
+            "0");
+    Dataset<Row> scanDF = readGroup(groupId, group, readOptions);
+
+    if (usesEqualityDeleteJoin(group)) {
+      // the joins repartition rows into spark.sql.shuffle.partitions; coalesce so each output
+      // partition becomes one file of the planned size, as splits do on the reader-local path
+      scanDF = scanDF.coalesce(Math.max(1, group.expectedOutputFiles()));
+    }
 
     // write the packed data into new files where each split becomes a new file
     scanDF

@@ -18,25 +18,37 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import static org.apache.spark.sql.functions.input_file_name;
+
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.spark.FileRewriteCoordinator;
 import org.apache.iceberg.spark.ScanTaskSetManager;
+import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkTableCache;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.storage.StorageLevel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 abstract class SparkDataFileRewriteRunner
     extends SparkRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> {
+
+  private static final Logger LOG = LoggerFactory.getLogger(SparkDataFileRewriteRunner.class);
 
   /**
    * Max amount of applicable equality-delete records the reader-local delete filter should handle
@@ -72,6 +84,10 @@ abstract class SparkDataFileRewriteRunner
   private StorageLevel eqDeleteJoinCacheStorageLevel =
       StorageLevel.fromString(EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL_DEFAULT);
 
+  private EqualityDeleteJoinPlan joinPlan = EqualityDeleteJoinPlan.empty();
+  private EqualityDeleteCacheManager cacheManager = null;
+  private EqualityDeleteJoinFilter joinFilter = null;
+
   SparkDataFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
   }
@@ -100,12 +116,29 @@ abstract class SparkDataFileRewriteRunner
     return eqDeleteJoinCacheStorageLevel;
   }
 
+  /**
+   * Enables the merge/join path for the groups selected in the plan. Called by the action once per
+   * execution before any group is rewritten; the action owns the cache manager lifecycle.
+   */
+  void enableEqualityDeleteJoin(EqualityDeleteJoinPlan plan, EqualityDeleteCacheManager caches) {
+    Preconditions.checkArgument(plan != null, "Invalid equality-delete join plan: null");
+    Preconditions.checkArgument(caches != null, "Invalid equality-delete cache manager: null");
+    this.joinPlan = plan;
+    this.cacheManager = caches;
+    this.joinFilter =
+        new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark(), table()), caches);
+  }
+
+  boolean usesEqualityDeleteJoin(RewriteFileGroup group) {
+    return joinPlan.usesJoin(group.info().globalIndex());
+  }
+
   @Override
   public Set<DataFile> rewrite(RewriteFileGroup group) {
     String groupId = UUID.randomUUID().toString();
     try {
       tableCache.add(groupId, table());
-      taskSetManager.stageTasks(table(), groupId, group.fileScanTasks());
+      taskSetManager.stageTasks(table(), groupId, scanTasks(group));
 
       doRewrite(groupId, group);
 
@@ -114,7 +147,50 @@ abstract class SparkDataFileRewriteRunner
       tableCache.remove(groupId);
       taskSetManager.removeTasks(table(), groupId);
       coordinator.clearRewrite(table(), groupId);
+      // the action never retries a group, so leaving this method is the group's terminal outcome
+      if (cacheManager != null) {
+        cacheManager.onGroupTerminal(group.info().globalIndex());
+      }
     }
+  }
+
+  /**
+   * Reads the staged file group. On the merge/join path the rows are read with equality deletes
+   * removed from the scan tasks and filtered against the merged equality-delete DataFrames; the
+   * result has exactly the table columns.
+   */
+  Dataset<Row> readGroup(String groupId, RewriteFileGroup group, Map<String, String> readOptions) {
+    Dataset<Row> rows =
+        spark()
+            .read()
+            .format("iceberg")
+            .option(SparkReadOptions.SCAN_TASK_SET_ID, groupId)
+            .options(readOptions)
+            .load(groupId);
+
+    if (!usesEqualityDeleteJoin(group)) {
+      return rows;
+    }
+
+    EqualityDeleteJoinPlan.GroupJoinInfo info = joinPlan.joinInfo(group.info().globalIndex());
+    LOG.info(
+        "Rewriting file group {} of {} with the equality-delete merge/join path ({} equality delete files, {} cache keys)",
+        group.info().globalIndex(),
+        table().name(),
+        info.equalityDeleteFileCount(),
+        info.cacheKeys().size());
+    Dataset<Row> rowsWithFile = rows.withColumn(EqualityDeleteScans.FILE_COLUMN, input_file_name());
+    return joinFilter.filter(rowsWithFile, info);
+  }
+
+  private List<FileScanTask> scanTasks(RewriteFileGroup group) {
+    if (usesEqualityDeleteJoin(group)) {
+      return group.fileScanTasks().stream()
+          .map(EqualityDeleteScans::withoutEqualityDeletes)
+          .collect(Collectors.toList());
+    }
+
+    return group.fileScanTasks();
   }
 
   private static StorageLevel cacheStorageLevel(Map<String, String> options) {

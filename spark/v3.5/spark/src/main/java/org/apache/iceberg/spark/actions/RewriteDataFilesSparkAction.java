@@ -36,7 +36,6 @@ import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.BinPackRewriteFilePlanner;
 import org.apache.iceberg.actions.FileRewritePlan;
-import org.apache.iceberg.actions.FileRewriteRunner;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles;
 import org.apache.iceberg.actions.ImmutableRewriteDataFiles.Result.Builder;
 import org.apache.iceberg.actions.RewriteDataFiles;
@@ -51,6 +50,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Queues;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.math.IntMath;
@@ -97,7 +97,7 @@ public class RewriteDataFilesSparkAction
   private boolean useStartingSequenceNumber;
   private boolean caseSensitive;
   private BinPackRewriteFilePlanner planner = null;
-  private FileRewriteRunner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> runner = null;
+  private SparkDataFileRewriteRunner runner = null;
 
   RewriteDataFilesSparkAction(SparkSession spark, Table table) {
     super(spark.cloneSession());
@@ -174,10 +174,22 @@ public class RewriteDataFilesSparkAction
       return EMPTY_RESULT;
     }
 
-    Builder resultBuilder =
-        partialProgressEnabled
-            ? doExecuteWithPartialProgress(plan, commitManager(startingSnapshotId))
-            : doExecute(plan, commitManager(startingSnapshotId));
+    List<RewriteFileGroup> plannedGroups = Lists.newArrayList(plan.groups());
+    EqualityDeleteJoinPlan joinPlan =
+        EqualityDeleteJoinPlan.plan(table, plannedGroups, runner.eqDeleteJoinThresholdRecords());
+    List<RewriteFileGroup> groups = joinPlan.orderGroups(plannedGroups);
+
+    Builder resultBuilder;
+    try (EqualityDeleteCacheManager cacheManager =
+        new EqualityDeleteCacheManager(
+            spark(), table, joinPlan, runner.eqDeleteJoinCacheStorageLevel())) {
+      runner.enableEqualityDeleteJoin(joinPlan, cacheManager);
+      resultBuilder =
+          partialProgressEnabled
+              ? doExecuteWithPartialProgress(plan, groups, commitManager(startingSnapshotId))
+              : doExecute(plan, groups, commitManager(startingSnapshotId));
+    }
+
     ImmutableRewriteDataFiles.Result result = resultBuilder.build();
 
     if (removeDanglingDeletes) {
@@ -235,13 +247,14 @@ public class RewriteDataFilesSparkAction
 
   private Builder doExecute(
       FileRewritePlan<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> plan,
+      List<RewriteFileGroup> groups,
       RewriteDataFilesCommitManager commitManager) {
     ExecutorService rewriteService = rewriteService();
 
     ConcurrentLinkedQueue<RewriteFileGroup> rewrittenGroups = Queues.newConcurrentLinkedQueue();
 
     Tasks.Builder<RewriteFileGroup> rewriteTaskBuilder =
-        Tasks.foreach(plan.groups())
+        Tasks.foreach(groups)
             .executeWith(rewriteService)
             .stopOnFailure()
             .noRetry()
@@ -299,6 +312,7 @@ public class RewriteDataFilesSparkAction
 
   private Builder doExecuteWithPartialProgress(
       FileRewritePlan<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> plan,
+      List<RewriteFileGroup> groups,
       RewriteDataFilesCommitManager commitManager) {
     ExecutorService rewriteService = rewriteService();
 
@@ -310,7 +324,7 @@ public class RewriteDataFilesSparkAction
 
     Collection<FileGroupFailureResult> rewriteFailures = new ConcurrentLinkedQueue<>();
     // start rewrite tasks
-    Tasks.foreach(plan.groups())
+    Tasks.foreach(groups)
         .suppressFailureWhenFinished()
         .executeWith(rewriteService)
         .noRetry()

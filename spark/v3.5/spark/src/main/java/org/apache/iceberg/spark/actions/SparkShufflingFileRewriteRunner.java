@@ -28,10 +28,10 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.SparkFunctionCatalog;
-import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SortOrderUtil;
@@ -104,12 +104,7 @@ abstract class SparkShufflingFileRewriteRunner extends SparkDataFileRewriteRunne
 
   @Override
   public void doRewrite(String groupId, RewriteFileGroup fileGroup) {
-    Dataset<Row> scanDF =
-        spark()
-            .read()
-            .format("iceberg")
-            .option(SparkReadOptions.SCAN_TASK_SET_ID, groupId)
-            .load(groupId);
+    Dataset<Row> scanDF = readGroup(groupId, fileGroup, ImmutableMap.of());
 
     Dataset<Row> sortedDF =
         sortedDF(

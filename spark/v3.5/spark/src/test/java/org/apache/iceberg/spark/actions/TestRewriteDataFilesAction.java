@@ -150,11 +150,24 @@ public class TestRewriteDataFilesAction extends TestBase {
 
   private static final PartitionSpec SPEC = PartitionSpec.builderFor(SCHEMA).identity("c1").build();
 
-  @Parameter private int formatVersion;
+  @Parameter(index = 0)
+  private int formatVersion;
 
-  @Parameters(name = "formatVersion = {0}")
-  protected static List<Integer> parameters() {
-    return org.apache.iceberg.TestHelpers.V2_AND_ABOVE;
+  @Parameter(index = 1)
+  private long eqDeleteJoinThreshold;
+
+  @Parameters(name = "formatVersion = {0}, eqDeleteJoinThreshold = {1}")
+  protected static Object[][] parameters() {
+    List<Object[]> params = Lists.newArrayList();
+    for (int version : org.apache.iceberg.TestHelpers.V2_AND_ABOVE) {
+      params.add(
+          new Object[] {
+            version, SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS_DEFAULT
+          });
+      params.add(new Object[] {version, 0L});
+    }
+
+    return params.toArray(new Object[0][]);
   }
 
   private final FileRewriteCoordinator coordinator = FileRewriteCoordinator.get();
@@ -177,7 +190,10 @@ public class TestRewriteDataFilesAction extends TestBase {
     table.refresh();
     return actions()
         .rewriteDataFiles(table)
-        .option(SizeBasedFileRewritePlanner.MIN_INPUT_FILES, "1");
+        .option(SizeBasedFileRewritePlanner.MIN_INPUT_FILES, "1")
+        .option(
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS,
+            String.valueOf(eqDeleteJoinThreshold));
   }
 
   @TestTemplate
@@ -717,6 +733,7 @@ public class TestRewriteDataFilesAction extends TestBase {
 
     shouldHaveSnapshots(table, 7);
     shouldHaveFiles(table, 5);
+    shouldHaveNoCachedDataFrames();
   }
 
   @TestTemplate
@@ -2204,6 +2221,12 @@ public class TestRewriteDataFilesAction extends TestBase {
 
   protected void shouldHaveACleanCache(Table table) {
     assertThat(cacheContents(table)).as("Should not have any entries in cache").isEmpty();
+  }
+
+  protected void shouldHaveNoCachedDataFrames() {
+    assertThat(spark.sharedState().cacheManager().isEmpty())
+        .as("Should not leave persisted merged equality-delete DataFrames behind")
+        .isTrue();
   }
 
   protected <T> void shouldHaveLastCommitSorted(Table table, String column) {
