@@ -126,7 +126,7 @@ abstract class SparkDataFileRewriteRunner
     this.joinPlan = plan;
     this.cacheManager = caches;
     this.joinFilter =
-        new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark(), table()), caches);
+        new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark(), table(), plan), caches);
   }
 
   boolean usesEqualityDeleteJoin(RewriteFileGroup group) {

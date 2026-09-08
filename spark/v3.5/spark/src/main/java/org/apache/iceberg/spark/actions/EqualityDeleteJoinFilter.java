@@ -31,12 +31,12 @@ import org.apache.spark.sql.Row;
  *
  * <p>The input rows carry {@link EqualityDeleteScans#FILE_COLUMN}, the location of the data file
  * each row was read from, produced with {@code input_file_name()}. A broadcast join attaches each
- * data file's sequence number and partition scope, then every merged delete DataFrame is left-outer
- * joined with null-safe key equality (plus scope equality for partition-scoped deletes). A row
- * survives a join unless {@code data_sequence_number < latest_delete_sequence_number}. Rows must
- * survive every join to be written. Key expressions come from {@link EqualityKeyPath}, so a key
- * nested in structs is compared as the reader-local {@code StructProjection} compares it: a null
- * parent struct matches only a null parent struct.
+ * data file's sequence number and partition scope ID, then every merged delete DataFrame is
+ * left-outer joined with null-safe key equality (plus scope equality for partition-scoped deletes).
+ * A row survives a join unless {@code data_sequence_number < latest_delete_sequence_number}. Rows
+ * must survive every join to be written. Key expressions come from {@link EqualityKeyPath}, so a
+ * key nested in structs is compared as the reader-local {@code StructProjection} compares it: a
+ * null parent struct matches only a null parent struct.
  *
  * <p>Only the join helper columns ({@code __rewrite_*}) are removed from the result, so it keeps
  * every other column of the input rows: the table columns plus any metadata columns the staged read

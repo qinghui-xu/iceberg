@@ -282,13 +282,50 @@ public class TestEqualityDeleteJoinPlan {
         .hasMessageContaining("File group 42 does not use the equality-delete join path");
   }
 
+  // ---- partition scope IDs ----
+
   @Test
-  public void scopeKeyUsesSpecIdAndPartitionPath() {
+  public void scopeIdsIdentifyPartitionsStructurally() {
     Table table = partitionedTable();
-    assertThat(EqualityDeleteJoinPlan.scopeKey(table.spec(), partition("a")))
-        .isEqualTo("0/category=a");
-    Table unpartitioned = unpartitionedTable();
-    assertThat(EqualityDeleteJoinPlan.scopeKey(unpartitioned.spec(), partition())).isEqualTo("0/");
+    // an actual NULL and the string "null" render to the same partition path but are distinct
+    DataFile nullFile = appendRows(table, partition((Object) null), record(SCHEMA, 1, "a", null));
+    DataFile literalFile = appendRows(table, partition("null"), record(SCHEMA, 2, "a", "null"));
+    DeleteFile delete = addEqualityDeletes(table, partition((Object) null), "data", "a");
+
+    Map<String, FileScanTask> tasks = tasksByLocation(table);
+    RewriteFileGroup group = group(1, Lists.newArrayList(tasks.values()));
+    EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
+
+    int nullScope = plan.scopeId(tasks.get(nullFile.location()).file());
+    int literalScope = plan.scopeId(tasks.get(literalFile.location()).file());
+    assertThat(nullScope)
+        .as("A NULL partition and a partition holding the string \"null\" are distinct scopes")
+        .isNotEqualTo(literalScope);
+    assertThat(plan.scopeId(delete))
+        .as("A delete file shares the scope of the data files it applies to")
+        .isEqualTo(nullScope);
+    assertThat(ImmutableList.of(nullScope, literalScope)).containsExactlyInAnyOrder(0, 1);
+  }
+
+  @Test
+  public void scopeIdOfUnplannedFileFails() {
+    Table table = partitionedTable();
+    DataFile inGroup = appendRows(table, partition("a"), record(SCHEMA, 1, "x", "a"));
+    addEqualityDeletes(table, partition("a"), "id", 1);
+    DataFile outsideGroup = appendRows(table, partition("b"), record(SCHEMA, 2, "x", "b"));
+
+    Map<String, FileScanTask> tasks = tasksByLocation(table);
+    RewriteFileGroup group = group(1, ImmutableList.of(tasks.get(inGroup.location())));
+    EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
+
+    assertThatThrownBy(() -> plan.scopeId(tasks.get(outsideGroup.location()).file()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot find the partition scope of file")
+        .hasMessageContaining(outsideGroup.location());
+    assertThatThrownBy(() -> EqualityDeleteJoinPlan.empty().scopeId(inGroup))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Cannot find the partition scope of file")
+        .hasMessageContaining(inGroup.location());
   }
 
   @Test

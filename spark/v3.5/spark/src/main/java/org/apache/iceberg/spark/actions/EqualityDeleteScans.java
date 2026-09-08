@@ -74,9 +74,9 @@ class EqualityDeleteScans {
   static final String FILE_COLUMN = "__rewrite_file_path";
   static final String LOCATION_COLUMN = "__rewrite_file_location";
   static final String SEQUENCE_NUMBER_COLUMN = "__rewrite_data_sequence_number";
-  static final String SCOPE_COLUMN = "__rewrite_scope_key";
+  static final String SCOPE_COLUMN = "__rewrite_scope_id";
   static final String DELETE_KEY_PREFIX = "__rewrite_delete_key_";
-  static final String DELETE_SCOPE_COLUMN = "__rewrite_delete_scope_key";
+  static final String DELETE_SCOPE_COLUMN = "__rewrite_delete_scope_id";
   static final String DELETE_SEQUENCE_NUMBER_COLUMN = "__rewrite_delete_sequence_number";
 
   private static final StructType FILE_ATTRIBUTES_SCHEMA =
@@ -84,15 +84,18 @@ class EqualityDeleteScans {
           new StructField[] {
             new StructField(LOCATION_COLUMN, DataTypes.StringType, false, Metadata.empty()),
             new StructField(SEQUENCE_NUMBER_COLUMN, DataTypes.LongType, false, Metadata.empty()),
-            new StructField(SCOPE_COLUMN, DataTypes.StringType, false, Metadata.empty())
+            new StructField(SCOPE_COLUMN, DataTypes.IntegerType, false, Metadata.empty())
           });
 
   private final SparkSession spark;
   private final Table table;
+  private final EqualityDeleteJoinPlan plan;
 
-  EqualityDeleteScans(SparkSession spark, Table table) {
+  EqualityDeleteScans(SparkSession spark, Table table, EqualityDeleteJoinPlan plan) {
+    Preconditions.checkArgument(plan != null, "Invalid equality-delete join plan: null");
     this.spark = spark;
     this.table = table;
+    this.plan = plan;
   }
 
   /**
@@ -147,16 +150,17 @@ class EqualityDeleteScans {
     return EqualityKeyPath.of(table.schema(), equalityFieldIds);
   }
 
-  /** One row per file with its location, data sequence number and partition scope. */
+  /**
+   * One row per file with its location, data sequence number and partition scope ID.
+   *
+   * <p>The scope IDs come from the plan so that both sides of a partition-scoped join agree on
+   * them, and so that partitions are compared structurally rather than by their human-readable
+   * path, which renders a string value of {@code "null"} and an actual {@code NULL} the same way.
+   */
   Dataset<Row> fileAttributes(Iterable<? extends ContentFile<?>> files) {
     List<Row> rows = Lists.newArrayList();
     for (ContentFile<?> file : files) {
-      PartitionSpec spec = table.specs().get(file.specId());
-      rows.add(
-          RowFactory.create(
-              file.location(),
-              file.dataSequenceNumber(),
-              EqualityDeleteJoinPlan.scopeKey(spec, file.partition())));
+      rows.add(RowFactory.create(file.location(), file.dataSequenceNumber(), plan.scopeId(file)));
     }
 
     return spark.createDataFrame(rows, FILE_ATTRIBUTES_SCHEMA);

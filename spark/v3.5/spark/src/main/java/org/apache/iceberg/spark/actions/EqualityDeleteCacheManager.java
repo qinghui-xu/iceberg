@@ -64,7 +64,7 @@ class EqualityDeleteCacheManager implements Closeable {
     this(
         plan.requiredCachesByGroup(),
         storageLevel,
-        new EqualityDeleteScans(spark, table)::mergedDeletes,
+        new EqualityDeleteScans(spark, table, plan)::mergedDeletes,
         stagingId -> {
           SparkTableCache.get().remove(stagingId);
           ScanTaskSetManager.get().removeTasks(table, stagingId);

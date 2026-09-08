@@ -21,12 +21,12 @@ package org.apache.iceberg.spark.actions;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionSpec;
-import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -37,6 +37,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.DeleteFileSet;
+import org.apache.iceberg.util.StructLikeWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,23 +50,31 @@ import org.slf4j.LoggerFactory;
  * groups is validated against the current table schema here, so an unsupported key fails the action
  * before any file group is rewritten. The dependency maps are immutable once the plan is built;
  * file groups are identified by {@code FileGroupInfo.globalIndex()}.
+ *
+ * <p>The plan also owns the {@link #scopeId(ContentFile) partition scope IDs} of every file it
+ * selects. The IDs must come from this single plan-wide registry because a merged delete DataFrame
+ * is shared by several file groups, so both sides of a partition-scoped join must agree on them.
  */
 class EqualityDeleteJoinPlan {
   private static final Logger LOG = LoggerFactory.getLogger(EqualityDeleteJoinPlan.class);
   private static final EqualityDeleteJoinPlan EMPTY =
-      new EqualityDeleteJoinPlan(ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of());
+      new EqualityDeleteJoinPlan(
+          ImmutableMap.of(), ImmutableMap.of(), ImmutableMap.of(), new ScopeRegistry());
 
   private final Map<Integer, GroupJoinInfo> joinInfoByGroup;
   private final Map<Integer, Set<DeleteCacheKey>> requiredCachesByGroup;
   private final Map<DeleteCacheKey, Set<Integer>> consumersByCache;
+  private final ScopeRegistry scopes;
 
   private EqualityDeleteJoinPlan(
       Map<Integer, GroupJoinInfo> joinInfoByGroup,
       Map<Integer, Set<DeleteCacheKey>> requiredCachesByGroup,
-      Map<DeleteCacheKey, Set<Integer>> consumersByCache) {
+      Map<DeleteCacheKey, Set<Integer>> consumersByCache,
+      ScopeRegistry scopes) {
     this.joinInfoByGroup = joinInfoByGroup;
     this.requiredCachesByGroup = requiredCachesByGroup;
     this.consumersByCache = consumersByCache;
+    this.scopes = scopes;
   }
 
   /** A plan in which every group uses the reader-local path. */
@@ -89,6 +98,7 @@ class EqualityDeleteJoinPlan {
     Map<Integer, GroupJoinInfo> joinInfos = Maps.newLinkedHashMap();
     Map<Integer, Set<DeleteCacheKey>> requiredCaches = Maps.newLinkedHashMap();
     Map<DeleteCacheKey, Set<Integer>> consumers = Maps.newLinkedHashMap();
+    ScopeRegistry scopes = new ScopeRegistry();
 
     for (RewriteFileGroup group : groups) {
       if (!useMergeJoin(group, thresholdRecords)) {
@@ -101,6 +111,13 @@ class EqualityDeleteJoinPlan {
       requiredCaches.put(groupIndex, info.cacheKeys());
       for (DeleteCacheKey key : info.cacheKeys()) {
         consumers.computeIfAbsent(key, ignored -> Sets.newLinkedHashSet()).add(groupIndex);
+        for (DeleteFile delete : key.deleteFiles()) {
+          scopes.register(table, delete);
+        }
+      }
+
+      for (DataFile dataFile : info.dataFiles()) {
+        scopes.register(table, dataFile);
       }
 
       LOG.info(
@@ -119,7 +136,8 @@ class EqualityDeleteJoinPlan {
     return new EqualityDeleteJoinPlan(
         ImmutableMap.copyOf(joinInfos),
         ImmutableMap.copyOf(requiredCaches),
-        immutableConsumers.build());
+        immutableConsumers.build(),
+        scopes);
   }
 
   /**
@@ -203,11 +221,66 @@ class EqualityDeleteJoinPlan {
   }
 
   /**
-   * Partition scope of a content file: partition-scoped equality deletes apply only to data files
-   * with the same spec ID and partition value, which is exactly what this key encodes.
+   * Partition scope of a content file: partition-scoped equality deletes apply only to files with
+   * the same spec ID and partition value, which is exactly what this ID identifies.
+   *
+   * <p>Partitions are compared structurally, so distinct partitions never share an ID even when
+   * they render to the same human-readable partition path, as a string value of {@code "null"} and
+   * an actual {@code NULL} do.
+   *
+   * @param file a data or delete file of a group selected by this plan
+   * @return the plan-wide ID of the file's partition scope
+   * @throws IllegalArgumentException if the file was not registered by this plan
    */
-  static String scopeKey(PartitionSpec spec, StructLike partition) {
-    return spec.specId() + "/" + spec.partitionToPath(partition);
+  int scopeId(ContentFile<?> file) {
+    return scopes.lookup(file);
+  }
+
+  /**
+   * Assigns dense plan-wide IDs to the distinct partition scopes of the files of every selected
+   * group, in first-seen order.
+   *
+   * <p>Only {@link #plan} registers scopes, before the plan is constructed, so the registry is
+   * read-only once the plan is published and lookups from concurrent group rewrites are safe.
+   */
+  private static class ScopeRegistry {
+    private final Map<Integer, StructLikeWrapper> wrappersBySpec = Maps.newHashMap();
+    private final Map<Integer, Map<StructLikeWrapper, Integer>> idsBySpec = Maps.newHashMap();
+    private int nextId = 0;
+
+    void register(Table table, ContentFile<?> file) {
+      PartitionSpec spec = table.specs().get(file.specId());
+      Preconditions.checkArgument(
+          spec != null,
+          "Cannot find partition spec %s of file %s in table %s",
+          file.specId(),
+          file.location(),
+          table.name());
+      StructLikeWrapper wrapper =
+          wrappersBySpec
+              .computeIfAbsent(
+                  spec.specId(), ignored -> StructLikeWrapper.forType(spec.partitionType()))
+              .copyFor(file.partition());
+      Map<StructLikeWrapper, Integer> ids =
+          idsBySpec.computeIfAbsent(spec.specId(), ignored -> Maps.newHashMap());
+      if (!ids.containsKey(wrapper)) {
+        ids.put(wrapper, nextId);
+        this.nextId = nextId + 1;
+      }
+    }
+
+    int lookup(ContentFile<?> file) {
+      StructLikeWrapper prototype = wrappersBySpec.get(file.specId());
+      Map<StructLikeWrapper, Integer> ids = idsBySpec.get(file.specId());
+      Integer id = prototype == null ? null : ids.get(prototype.copyFor(file.partition()));
+      Preconditions.checkArgument(
+          id != null,
+          "Cannot find the partition scope of file %s: spec %s and partition %s are not part of the equality-delete join plan",
+          file.location(),
+          file.specId(),
+          file.partition());
+      return id;
+    }
   }
 
   /** Everything the join filter needs for one merge/join file group. */

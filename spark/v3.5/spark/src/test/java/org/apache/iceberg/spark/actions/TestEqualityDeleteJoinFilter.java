@@ -95,7 +95,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
 
     RewriteFileGroup group = group(1, allTasks(table));
     EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
-    EqualityDeleteScans scans = new EqualityDeleteScans(spark, table);
+    EqualityDeleteScans scans = new EqualityDeleteScans(spark, table, plan);
 
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
@@ -131,7 +131,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       assertEquals(
@@ -157,7 +157,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       assertEquals(
@@ -190,12 +190,37 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       assertEquals(
           "Global deletes remove older rows in every partition; position deletes are still applied",
           ImmutableList.of(row(3, "a", "z")),
+          rowsToJava(survivors.collectAsList()));
+    }
+  }
+
+  @Test
+  public void partitionScopedDeletesDistinguishNullFromTheStringNull() {
+    Table table = partitionedTable();
+    // both partitions render to the same human-readable path, category=null
+    appendRows(table, partition((Object) null), record(SCHEMA, 1, "a", null)); // seq 1
+    appendRows(table, partition("null"), record(SCHEMA, 2, "a", "null")); // seq 2
+    addEqualityDeletes(table, partition((Object) null), "data", "a"); // seq 3, scoped to NULL
+
+    RewriteFileGroup group = group(1, allTasks(table));
+    EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
+    assertThat(plan.joinInfo(1).partitionScopedKeys()).hasSize(1);
+
+    try (EqualityDeleteCacheManager caches =
+        new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
+      Dataset<Row> survivors =
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
+              .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
+
+      assertEquals(
+          "The delete scoped to a NULL partition must not remove the row of category='null'",
+          ImmutableList.of(row(2, "a", "null")),
           rowsToJava(survivors.collectAsList()));
     }
   }
@@ -229,7 +254,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       assertThat(survivors.columns()).containsExactly("id", "location", "data");
@@ -267,7 +292,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       List<Object[]> joined = rowsToJava(survivors.collectAsList());
@@ -311,7 +336,7 @@ public class TestEqualityDeleteJoinFilter extends TestBase {
     try (EqualityDeleteCacheManager caches =
         new EqualityDeleteCacheManager(spark, table, plan, StorageLevel.MEMORY_AND_DISK())) {
       Dataset<Row> survivors =
-          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table), caches)
+          new EqualityDeleteJoinFilter(new EqualityDeleteScans(spark, table, plan), caches)
               .filter(readWithoutEqualityDeletes(table, group), plan.joinInfo(1));
 
       assertEquals(

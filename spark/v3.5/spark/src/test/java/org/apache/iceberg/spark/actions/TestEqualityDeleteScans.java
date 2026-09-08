@@ -32,6 +32,7 @@ import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.addPositio
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.appendRows;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.cityDelete;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.fieldId;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.group;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.partition;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.record;
 import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.struct;
@@ -55,11 +56,13 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.data.FileHelpers;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.ScanTaskSetManager;
 import org.apache.iceberg.spark.SparkTableCache;
 import org.apache.iceberg.spark.TestBase;
@@ -126,7 +129,8 @@ public class TestEqualityDeleteScans extends TestBase {
   @Test
   public void keyPathsResolveFieldsByIdInRequestedOrder() {
     Table table = TABLES.create(NESTED_SCHEMA, PartitionSpec.unpartitioned(), V2, newLocation());
-    EqualityDeleteScans scans = new EqualityDeleteScans(spark, table);
+    EqualityDeleteScans scans =
+        new EqualityDeleteScans(spark, table, EqualityDeleteJoinPlan.empty());
 
     List<EqualityKeyPath> paths =
         scans.keyPaths(ImmutableList.of(fieldId(table, "location.city"), fieldId(table, "id")));
@@ -162,10 +166,12 @@ public class TestEqualityDeleteScans extends TestBase {
         record(deleteRowSchema, (Object) null));
     DeleteCacheKey key =
         DeleteCacheKey.of(ImmutableList.of(cityIds[0]), TestHelpers.deleteFiles(table), false);
+    EqualityDeleteJoinPlan plan = planOf(table);
 
     String stagingId = UUID.randomUUID().toString();
     try {
-      Dataset<Row> merged = new EqualityDeleteScans(spark, table).mergedDeletes(key, stagingId);
+      Dataset<Row> merged =
+          new EqualityDeleteScans(spark, table, plan).mergedDeletes(key, stagingId);
 
       assertThat(merged.columns())
           .containsExactly(DELETE_KEY_PREFIX + "0", DELETE_SEQUENCE_NUMBER_COLUMN);
@@ -186,21 +192,25 @@ public class TestEqualityDeleteScans extends TestBase {
     Table table = partitionedTable();
     DataFile fileA = appendRows(table, partition("a"), record(SCHEMA, 1, "x", "a")); // seq 1
     DataFile fileB = appendRows(table, partition("b"), record(SCHEMA, 2, "x", "b")); // seq 2
+    addEqualityDeletes(table, partition("a"), "id", 1); // seq 3, selects the group for the join
     Map<String, FileScanTask> tasks = tasksByLocation(table);
+    List<DataFile> files =
+        ImmutableList.of(tasks.get(fileA.location()).file(), tasks.get(fileB.location()).file());
+    RewriteFileGroup group = group(1, Lists.newArrayList(tasks.values()));
+    EqualityDeleteJoinPlan plan = EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
 
-    Dataset<Row> attributes =
-        new EqualityDeleteScans(spark, table)
-            .fileAttributes(
-                ImmutableList.of(
-                    tasks.get(fileA.location()).file(), tasks.get(fileB.location()).file()));
+    Dataset<Row> attributes = new EqualityDeleteScans(spark, table, plan).fileAttributes(files);
 
     assertThat(attributes.columns())
         .containsExactly(LOCATION_COLUMN, SEQUENCE_NUMBER_COLUMN, SCOPE_COLUMN);
+    assertThat(attributes.schema().apply(SCOPE_COLUMN).dataType()).isEqualTo(DataTypes.IntegerType);
+    int scopeA = plan.scopeId(files.get(0));
+    int scopeB = plan.scopeId(files.get(1));
+    assertThat(scopeA).isNotEqualTo(scopeB);
     List<Object[]> rows = rowsToJava(attributes.sort(SEQUENCE_NUMBER_COLUMN).collectAsList());
     assertEquals(
-        "Attributes must match planned files",
-        ImmutableList.of(
-            row(fileA.location(), 1L, "0/category=a"), row(fileB.location(), 2L, "0/category=b")),
+        "Attributes must carry the plan scope ID of each file",
+        ImmutableList.of(row(fileA.location(), 1L, scopeA), row(fileB.location(), 2L, scopeB)),
         rows);
   }
 
@@ -212,10 +222,12 @@ public class TestEqualityDeleteScans extends TestBase {
     addEqualityDeletes(table, null, "id", 2, 3); // seq 3
     DeleteCacheKey key =
         DeleteCacheKey.of(ImmutableList.of(1), TestHelpers.deleteFiles(table), false);
+    EqualityDeleteJoinPlan plan = planOf(table);
 
     String stagingId = UUID.randomUUID().toString();
     try {
-      Dataset<Row> merged = new EqualityDeleteScans(spark, table).mergedDeletes(key, stagingId);
+      Dataset<Row> merged =
+          new EqualityDeleteScans(spark, table, plan).mergedDeletes(key, stagingId);
 
       assertThat(merged.columns())
           .containsExactly(DELETE_KEY_PREFIX + "0", DELETE_SEQUENCE_NUMBER_COLUMN);
@@ -234,25 +246,28 @@ public class TestEqualityDeleteScans extends TestBase {
     Table table = partitionedTable();
     appendRows(table, partition("a"), record(SCHEMA, 1, null, "a")); // seq 1
     appendRows(table, partition("b"), record(SCHEMA, 2, null, "b")); // seq 2
-    addEqualityDeletes(table, partition("a"), "data", (Object) null); // seq 3
-    addEqualityDeletes(table, partition("b"), "data", null, "z"); // seq 4
+    DeleteFile deleteA = addEqualityDeletes(table, partition("a"), "data", (Object) null); // seq 3
+    DeleteFile deleteB = addEqualityDeletes(table, partition("b"), "data", null, "z"); // seq 4
     DeleteCacheKey key =
         DeleteCacheKey.of(ImmutableList.of(2), TestHelpers.deleteFiles(table), true);
+    EqualityDeleteJoinPlan plan = planOf(table);
+    int scopeA = plan.scopeId(deleteA);
+    int scopeB = plan.scopeId(deleteB);
 
     String stagingId = UUID.randomUUID().toString();
     try {
-      Dataset<Row> merged = new EqualityDeleteScans(spark, table).mergedDeletes(key, stagingId);
+      Dataset<Row> merged =
+          new EqualityDeleteScans(spark, table, plan).mergedDeletes(key, stagingId);
 
       assertThat(merged.columns())
           .containsExactly(
               DELETE_KEY_PREFIX + "0", DELETE_SCOPE_COLUMN, DELETE_SEQUENCE_NUMBER_COLUMN);
+      assertThat(scopeA).isNotEqualTo(scopeB);
       assertEquals(
           "Null keys must be kept and scopes must come from the delete file partition",
-          ImmutableList.of(
-              row(null, "0/category=a", 3L),
-              row(null, "0/category=b", 4L),
-              row("z", "0/category=b", 4L)),
-          rowsToJava(merged.sort(DELETE_SCOPE_COLUMN, DELETE_KEY_PREFIX + "0").collectAsList()));
+          ImmutableList.of(row(null, scopeA, 3L), row(null, scopeB, 4L), row("z", scopeB, 4L)),
+          rowsToJava(
+              merged.sort(DELETE_KEY_PREFIX + "0", DELETE_SEQUENCE_NUMBER_COLUMN).collectAsList()));
     } finally {
       SparkTableCache.get().remove(stagingId);
       ScanTaskSetManager.get().removeTasks(table, stagingId);
@@ -272,10 +287,12 @@ public class TestEqualityDeleteScans extends TestBase {
     commitEqualityDelete(table, deleteRowSchema, delete); // seq 2
     DeleteCacheKey key =
         DeleteCacheKey.of(ImmutableList.of(2, 1), TestHelpers.deleteFiles(table), false);
+    EqualityDeleteJoinPlan plan = planOf(table);
 
     String stagingId = UUID.randomUUID().toString();
     try {
-      Dataset<Row> merged = new EqualityDeleteScans(spark, table).mergedDeletes(key, stagingId);
+      Dataset<Row> merged =
+          new EqualityDeleteScans(spark, table, plan).mergedDeletes(key, stagingId);
 
       assertThat(key.equalityFieldIds()).containsExactly(1, 2);
       assertThat(merged.columns())
@@ -308,6 +325,12 @@ public class TestEqualityDeleteScans extends TestBase {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  /** Plan over a single group holding every planned task, so all files have a scope ID. */
+  private static EqualityDeleteJoinPlan planOf(Table table) {
+    RewriteFileGroup group = group(1, Lists.newArrayList(tasksByLocation(table).values()));
+    return EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L);
   }
 
   private Table unpartitionedTable() {
