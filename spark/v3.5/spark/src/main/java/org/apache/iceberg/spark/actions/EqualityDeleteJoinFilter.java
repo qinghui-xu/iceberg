@@ -37,6 +37,12 @@ import org.apache.spark.sql.Row;
  * survive every join to be written. Key expressions come from {@link EqualityKeyPath}, so a key
  * nested in structs is compared as the reader-local {@code StructProjection} compares it: a null
  * parent struct matches only a null parent struct.
+ *
+ * <p>Only the join helper columns ({@code __rewrite_*}) are removed from the result, so it keeps
+ * every other column of the input rows: the table columns plus any metadata columns the staged read
+ * exposes, such as {@code _row_id} and {@code _last_updated_sequence_number} on a row-lineage
+ * table. Those metadata columns must be preserved so the write keeps row lineage; do not narrow the
+ * result to the table columns.
  */
 class EqualityDeleteJoinFilter {
   private final EqualityDeleteScans scans;
@@ -48,10 +54,11 @@ class EqualityDeleteJoinFilter {
   }
 
   /**
-   * @param dataRows table columns plus {@link EqualityDeleteScans#FILE_COLUMN}, read with equality
-   *     deletes removed
+   * @param dataRows the staged read's columns plus {@link EqualityDeleteScans#FILE_COLUMN}, read
+   *     with equality deletes removed
    * @param info join information of the file group
-   * @return the surviving rows with exactly the table columns
+   * @return the surviving rows with the join helper columns removed, keeping the table columns and
+   *     any metadata columns the staged read exposes (row lineage on v3+)
    */
   Dataset<Row> filter(Dataset<Row> dataRows, GroupJoinInfo info) {
     Dataset<Row> attributes = scans.fileAttributes(info.dataFiles());

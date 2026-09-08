@@ -157,8 +157,13 @@ abstract class SparkDataFileRewriteRunner
   /**
    * Reads the staged file group. On the merge/join path the rows are read with equality deletes
    * removed from the scan tasks, tagged with the location of the data file they came from, and
-   * filtered against the merged equality-delete DataFrames; the result has exactly the table
-   * columns.
+   * filtered against the merged equality-delete DataFrames.
+   *
+   * <p>The result has the columns of the staged read with the join helper columns ({@code
+   * __rewrite_*}) removed: the table columns plus any metadata columns the staged read exposes,
+   * such as {@code _row_id} and {@code _last_updated_sequence_number} on a row-lineage table. Those
+   * metadata columns must be preserved so the write keeps row lineage; do not narrow the result to
+   * the table columns.
    */
   Dataset<Row> readGroup(String groupId, RewriteFileGroup group, Map<String, String> readOptions) {
     Dataset<Row> rows =
