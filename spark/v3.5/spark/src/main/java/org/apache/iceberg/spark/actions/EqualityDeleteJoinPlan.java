@@ -303,6 +303,7 @@ class EqualityDeleteJoinPlan {
 
     static GroupJoinInfo of(Table table, RewriteFileGroup group) {
       List<DataFile> dataFiles = Lists.newArrayList();
+      Set<String> dataFileLocations = Sets.newHashSet();
       Map<List<Integer>, Set<DeleteFile>> scopedFiles = Maps.newLinkedHashMap();
       Map<List<Integer>, Set<DeleteFile>> globalFiles = Maps.newLinkedHashMap();
       Set<DeleteFile> allEqualityDeletes = DeleteFileSet.create();
@@ -313,6 +314,12 @@ class EqualityDeleteJoinPlan {
         Preconditions.checkArgument(
             file.dataSequenceNumber() != null,
             "Cannot use the equality-delete join path: data file %s has no data sequence number",
+            file.location());
+        // the join reads each data file once, so a second task over the same file would duplicate
+        // every row of that file in the attribute join
+        Preconditions.checkArgument(
+            dataFileLocations.add(file.location()),
+            "Cannot use the equality-delete join path: file group has more than one task for data file %s",
             file.location());
         dataFiles.add(file);
 

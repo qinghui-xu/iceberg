@@ -282,6 +282,20 @@ public class TestEqualityDeleteJoinPlan {
         .hasMessageContaining("File group 42 does not use the equality-delete join path");
   }
 
+  @Test
+  public void duplicateDataFileTasksInOneGroupAreRejected() {
+    Table table = unpartitionedTable();
+    DataFile file = appendRows(table, null, record(SCHEMA, 1, "a", "x"));
+    addEqualityDeletes(table, null, "id", 1);
+
+    FileScanTask task = tasksByLocation(table).get(file.location());
+    RewriteFileGroup group = group(1, ImmutableList.of(task, task));
+
+    assertThatThrownBy(() -> EqualityDeleteJoinPlan.plan(table, ImmutableList.of(group), 0L))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("more than one task for data file " + file.location());
+  }
+
   // ---- partition scope IDs ----
 
   @Test
