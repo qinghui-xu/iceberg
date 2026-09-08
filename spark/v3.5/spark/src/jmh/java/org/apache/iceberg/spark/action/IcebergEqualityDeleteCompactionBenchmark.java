@@ -22,6 +22,7 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.util.Collections;
 import java.util.Random;
@@ -108,6 +109,7 @@ public class IcebergEqualityDeleteCompactionBenchmark {
                 "spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
             .config("spark.sql.catalog.spark_catalog.type", "hadoop")
             .config("spark.sql.catalog.spark_catalog.warehouse", warehouse())
+            .config("spark.driver.host", InetAddress.getLoopbackAddress().getHostAddress())
             .master("local[*]");
     spark = builder.getOrCreate();
     Configuration sparkHadoopConf = spark.sessionState().newHadoopConf();
