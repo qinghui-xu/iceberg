@@ -19,6 +19,15 @@
 package org.apache.iceberg.spark.actions;
 
 import static org.apache.iceberg.TableProperties.COMMIT_NUM_RETRIES;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.LOCATION_TYPE;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.NESTED_SCHEMA;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.addEqualityDeletes;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.appendRows;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.cityDelete;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.fieldId;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.partition;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.record;
+import static org.apache.iceberg.spark.actions.EqualityDeleteTestUtil.struct;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.apache.spark.sql.functions.current_date;
@@ -81,6 +90,7 @@ import org.apache.iceberg.actions.RewriteDataFiles.Result;
 import org.apache.iceberg.actions.RewriteDataFilesCommitManager;
 import org.apache.iceberg.actions.RewriteFileGroup;
 import org.apache.iceberg.actions.SizeBasedFileRewritePlanner;
+import org.apache.iceberg.data.FileHelpers;
 import org.apache.iceberg.data.GenericAppenderFactory;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
@@ -101,6 +111,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
@@ -2113,6 +2124,359 @@ public class TestRewriteDataFilesAction extends TestBase {
     assertEquals("Rows must match", expectedRecords, actualRecordsWithLineage);
   }
 
+  @TestTemplate
+  public void testEqualityDeleteJoinKeepsRowsWrittenAfterTheDelete() throws IOException {
+    Table table = createTable();
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, "a", "x"),
+            new ThreeColumnRecord(2, "b", "x"),
+            new ThreeColumnRecord(3, "c", "x"))); // seq 1
+    writeEqDeletes(table, null, "c1", 1, 2); // seq 2
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, "a2", "y"), new ThreeColumnRecord(4, "d", "y"))); // seq 3
+    table.refresh();
+    shouldHaveFiles(table, 2);
+
+    List<Object[]> expected = currentData();
+    assertThat(expected).as("Older rows 1 and 2 are deleted, newer row 1 survives").hasSize(3);
+
+    Result result =
+        basicRewrite(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .option(RewriteDataFiles.REMOVE_DANGLING_DELETES, "true")
+            .execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(2);
+    assertThat(result.addedDataFilesCount()).isEqualTo(1);
+    // RemoveDanglingDeletesSparkAction is a no-op for a single unpartitioned spec (the table-wide
+    // sequence-number filter in MergingSnapshotProducer already dropped the delete as part of this
+    // same commit), so removedDeleteFilesCount stays 0; the assertion below confirms the delete
+    // is actually gone.
+    assertThat(result.removedDeleteFilesCount()).isEqualTo(0);
+    assertEquals("Rows must match", expected, currentData());
+    assertThat(TestHelpers.deleteFiles(table)).as("The delete became dangling").isEmpty();
+    shouldHaveACleanCache(table);
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinMatchesNullKeys() throws IOException {
+    Table table = createTable();
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, null, "x"),
+            new ThreeColumnRecord(2, "b", "x"),
+            new ThreeColumnRecord(3, null, "y")));
+    writeEqDeletes(table, null, "c2", (Object) null);
+    table.refresh();
+
+    List<Object[]> expected = currentData();
+    assertThat(expected).hasSize(1);
+
+    basicRewrite(table).option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true").execute();
+
+    assertEquals("Rows with null keys must be deleted", expected, currentData());
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinAppliesEveryFieldIdSet() throws IOException {
+    Table table = createTable();
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, "a", "x"),
+            new ThreeColumnRecord(2, "b", "x"),
+            new ThreeColumnRecord(3, "c", "x"),
+            new ThreeColumnRecord(4, "d", "x")));
+    writeEqDeletes(table, null, "c1", 1);
+    writeEqDeletes(table, null, "c2", "b");
+    writeEqDeletes(table, null, "c1", 3);
+    table.refresh();
+
+    List<Object[]> expected = currentData();
+    assertThat(expected).hasSize(1);
+
+    basicRewrite(table).option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true").execute();
+
+    assertEquals("A row deleted by any field-id set must be removed", expected, currentData());
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinWithPositionDeletes() throws IOException {
+    Table table = createTable();
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, "a", "x"),
+            new ThreeColumnRecord(2, "b", "x"),
+            new ThreeColumnRecord(3, "c", "x"),
+            new ThreeColumnRecord(4, "d", "x")));
+    table.refresh();
+    DataFile dataFile = currentDataFiles(table).get(0);
+    RowDelta rowDelta = table.newRowDelta();
+    writePosDeletesOrDVs(table, dataFile, 1).forEach(rowDelta::addDeletes); // position 0
+    rowDelta.commit();
+    writeEqDeletes(table, null, "c1", 3);
+    table.refresh();
+
+    List<Object[]> expected = currentData();
+    assertThat(expected).as("One row removed by position, one by equality").hasSize(2);
+
+    Result result =
+        basicRewrite(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .option(RewriteDataFiles.REMOVE_DANGLING_DELETES, "true")
+            .execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(1);
+    assertEquals("Rows must match", expected, currentData());
+    assertThat(TestHelpers.deleteFiles(table)).isEmpty();
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinSort() throws IOException {
+    Table table = createTable(4);
+    writeEqDeletes(table, null, "c1", 1, 2, 3);
+    table.refresh();
+    List<Object[]> expected = currentData();
+
+    basicRewrite(table)
+        .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+        .option(
+            SizeBasedFileRewritePlanner.TARGET_FILE_SIZE_BYTES,
+            Integer.toString(averageFileSize(table)))
+        .sort(SortOrder.builderFor(table.schema()).asc("c2").build())
+        .execute();
+
+    assertEquals("Rows must match", expected, currentData());
+    shouldHaveMultipleFiles(table);
+    shouldHaveLastCommitSorted(table, "c2");
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinZOrder() throws IOException {
+    Table table = createTable(4);
+    writeEqDeletes(table, null, "c1", 1, 2, 3);
+    table.refresh();
+    List<Object[]> expected = currentData();
+
+    basicRewrite(table)
+        .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+        .option(
+            SizeBasedFileRewritePlanner.TARGET_FILE_SIZE_BYTES,
+            Integer.toString(averageFileSize(table)))
+        .zOrder("c2", "c3")
+        .execute();
+
+    assertEquals("Rows must match", expected, currentData());
+    shouldHaveMultipleFiles(table);
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinKeepsPartitionScopeAfterPartitionEvolution()
+      throws IOException {
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            SPEC,
+            ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion)),
+            tableLocation);
+    writeRecordsToOneFile(Lists.newArrayList(new ThreeColumnRecord(1, "x", "p1"))); // seq 1, c1=1
+    writeRecordsToOneFile(Lists.newArrayList(new ThreeColumnRecord(2, "x", "p2"))); // seq 2, c1=2
+    writeEqDeletes(table, partition(1), "c2", "x"); // seq 3, scoped to partition c1=1
+    table.refresh();
+    table.updateSpec().addField(Expressions.ref("c3")).commit(); // both files now share one group
+    table.refresh();
+
+    List<Object[]> expected = currentData();
+    assertEquals(
+        "Only the row in partition c1=1 is deleted", ImmutableList.of(row(2, "x", "p2")), expected);
+
+    Result result =
+        basicRewrite(table).option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true").execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(2);
+    assertEquals("The partition-scoped delete must not leak into c1=2", expected, currentData());
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinAppliesGlobalDeletesAcrossPartitions() throws IOException {
+    Table table =
+        TABLES.create(
+            SCHEMA,
+            SPEC,
+            ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion)),
+            tableLocation);
+    writeRecordsToOneFile(Lists.newArrayList(new ThreeColumnRecord(1, "x", "p1"))); // seq 1
+    writeRecordsToOneFile(Lists.newArrayList(new ThreeColumnRecord(2, "x", "p2"))); // seq 2
+    table.updateSpec().removeField("c1").commit(); // unpartitioned spec
+    table.refresh();
+    writeEqDeletes(table, null, "c2", "x"); // seq 3: global, deletes both older rows
+    writeRecordsToOneFile(Lists.newArrayList(new ThreeColumnRecord(3, "x", "p3"))); // seq 4
+    table.refresh();
+
+    List<Object[]> expected = currentData();
+    assertEquals("Only the newest row survives", ImmutableList.of(row(3, "x", "p3")), expected);
+
+    Result result =
+        basicRewrite(table).option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true").execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(3);
+    assertEquals("Rows must match", expected, currentData());
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinWithMultipleGroupsPerPartition() throws IOException {
+    Table table = createTablePartitioned(2, 4, 1000);
+    shouldHaveFiles(table, 8);
+    writeEqDeletes(table, partition(0, "fo"), "c3", "bar0", "bar1", "bar2");
+    writeEqDeletes(table, partition(1, "fo"), "c3", "bar3");
+    table.refresh();
+    List<Object[]> expected = currentData();
+
+    Result result =
+        basicRewrite(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .option(
+                SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES,
+                Long.toString(averageFileSize(table) * 2L + 1))
+            .option(RewriteDataFiles.MAX_CONCURRENT_FILE_GROUP_REWRITES, "4")
+            .execute();
+
+    assertThat(result.rewriteResults())
+        .as("Each partition is split into at least two file groups sharing one delete cache")
+        .hasSizeGreaterThanOrEqualTo(4);
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(8);
+    assertEquals("Rows must match", expected, currentData());
+    shouldHaveACleanCache(table);
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinReleasesCachesWhenRewriteFails() throws IOException {
+    Table table = createTable(4);
+    writeEqDeletes(table, null, "c1", 1);
+    table.refresh();
+    List<Object[]> expected = currentData();
+
+    RewriteDataFilesSparkAction realRewrite =
+        basicRewrite(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .option(
+                SizeBasedFileRewritePlanner.MAX_FILE_GROUP_SIZE_BYTES,
+                Long.toString(averageFileSize(table) * 2L + 1));
+    RewriteDataFilesSparkAction spyRewrite = spy(realRewrite);
+    doThrow(new RuntimeException("Rewrite Failed"))
+        .when(spyRewrite)
+        .rewriteFiles(any(), argThat(new GroupInfoMatcher(1)));
+
+    assertThatThrownBy(spyRewrite::execute)
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("Rewrite Failed");
+
+    table.refresh();
+    assertEquals("Table data must be unchanged", expected, currentData());
+    shouldHaveACleanCache(table);
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinWithNestedEqualityField() {
+    Table table =
+        TABLES.create(
+            NESTED_SCHEMA,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion)),
+            tableLocation);
+    int cityId = fieldId(table, "location.city");
+    appendRows(
+        table,
+        null,
+        record(NESTED_SCHEMA, 1, struct(LOCATION_TYPE, "paris", 75000), "a"),
+        record(NESTED_SCHEMA, 2, struct(LOCATION_TYPE, "rome", 100), "b"),
+        record(NESTED_SCHEMA, 3, struct(LOCATION_TYPE, null, 200), "c"),
+        record(NESTED_SCHEMA, 4, null, "d")); // seq 1
+    appendRows(
+        table, null, record(NESTED_SCHEMA, 5, struct(LOCATION_TYPE, "paris", 75001), "e")); // seq 2
+    Schema deleteRowSchema = table.schema().select("location.city");
+    // seq 3: keyed by location.city, nested in the location struct
+    addEqualityDeletes(
+        table,
+        null,
+        deleteRowSchema,
+        new int[] {cityId},
+        cityDelete(deleteRowSchema, "paris"),
+        cityDelete(deleteRowSchema, null));
+    appendRows(
+        table, null, record(NESTED_SCHEMA, 6, struct(LOCATION_TYPE, "paris", 75002), "f")); // seq 4
+    table.refresh();
+    shouldHaveFiles(table, 3);
+
+    List<Object[]> expected = nestedTableData();
+    assertEquals(
+        "Reader-local path: paris rows and the null-city row older than the delete are removed",
+        ImmutableList.of(
+            row(2, row("rome", 100), "b"), row(4, null, "d"), row(6, row("paris", 75002), "f")),
+        expected);
+
+    Result result =
+        basicRewrite(table)
+            .option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+            .option(RewriteDataFiles.REMOVE_DANGLING_DELETES, "true")
+            .execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(3);
+    assertThat(result.addedDataFilesCount()).isEqualTo(1);
+    // RemoveDanglingDeletesSparkAction is a no-op for a single unpartitioned spec (the table-wide
+    // sequence-number filter in MergingSnapshotProducer already dropped the delete as part of this
+    // same commit), so removedDeleteFilesCount stays 0; the assertion below confirms the delete
+    // is actually gone.
+    assertThat(result.removedDeleteFilesCount()).isEqualTo(0);
+    assertEquals("Rows must match on both delete paths", expected, nestedTableData());
+    assertThat(TestHelpers.deleteFiles(table))
+        .as("The nested-key delete became dangling")
+        .isEmpty();
+    shouldHaveACleanCache(table);
+    shouldHaveNoCachedDataFrames();
+  }
+
+  @TestTemplate
+  public void testEqualityDeleteJoinPreservesLineage() throws IOException {
+    assumeThat(formatVersion).isGreaterThan(2);
+    Table table = createTable();
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(1, "a", "x"),
+            new ThreeColumnRecord(2, "b", "x"),
+            new ThreeColumnRecord(3, "c", "x"))); // seq 1
+    writeRecordsToOneFile(
+        Lists.newArrayList(
+            new ThreeColumnRecord(4, "d", "y"), new ThreeColumnRecord(5, "e", "y"))); // seq 2
+    writeEqDeletes(table, null, "c1", 2, 4); // seq 3: removes one row from each data file
+    table.refresh();
+    shouldHaveFiles(table, 2);
+
+    List<Object[]> expected = currentDataWithLineage();
+    assertThat(expected).as("One row removed from each of the two data files").hasSize(3);
+
+    Result result =
+        basicRewrite(table).option(SizeBasedFileRewritePlanner.REWRITE_ALL, "true").execute();
+
+    assertThat(result.rewrittenDataFilesCount()).isEqualTo(2);
+    assertEquals(
+        "Row ids and last-updated sequence numbers of surviving rows must be unchanged",
+        expected,
+        currentDataWithLineage());
+    shouldHaveNoCachedDataFrames();
+  }
+
   protected void shouldRewriteDataFilesWithPartitionSpec(Table table, int outputSpecId) {
     List<DataFile> rewrittenFiles = currentDataFiles(table);
     assertThat(rewrittenFiles).allMatch(file -> file.specId() == outputSpecId);
@@ -2141,6 +2505,11 @@ public class TestRewriteDataFilesAction extends TestBase {
             .coalesce(1)
             .sort("c1", "c2", "c3")
             .collectAsList());
+  }
+
+  private List<Object[]> nestedTableData() {
+    return rowsToJava(
+        spark.read().format("iceberg").load(tableLocation).sort("id").collectAsList());
   }
 
   protected List<Object[]> currentDataWithLineage() {
@@ -2592,6 +2961,45 @@ public class TestRewriteDataFilesAction extends TestBase {
       throw new RuntimeException(e);
     }
     table.newRowDelta().addDeletes(eqDeleteWriter.toDeleteFile()).commit();
+  }
+
+  private void writeRecordsToOneFile(List<ThreeColumnRecord> records) {
+    writeDF(spark.createDataFrame(records, ThreeColumnRecord.class).coalesce(1));
+  }
+
+  /** Writes one equality delete file keyed by {@code deleteColumn} for the current spec. */
+  private DeleteFile writeEqDeletes(
+      Table table, StructLike partition, String deleteColumn, Object... deleteValues)
+      throws IOException {
+    Schema deleteRowSchema = table.schema().select(deleteColumn);
+    List<Record> deletes = Lists.newArrayList();
+    for (Object value : deleteValues) {
+      Record record = GenericRecord.create(deleteRowSchema);
+      record.setField(deleteColumn, value);
+      deletes.add(record);
+    }
+
+    OutputFile out =
+        table
+            .io()
+            .newOutputFile(
+                table
+                    .locationProvider()
+                    .newDataLocation(
+                        FileFormat.PARQUET.addExtension(UUID.randomUUID().toString())));
+    DeleteFile deleteFile =
+        FileHelpers.writeDeleteFile(table, out, partition, deletes, deleteRowSchema);
+    table.newRowDelta().addDeletes(deleteFile).commit();
+    return deleteFile;
+  }
+
+  private List<DeleteFile> writePosDeletesOrDVs(Table table, DataFile dataFile, int positions)
+      throws IOException {
+    if (formatVersion >= 3) {
+      return writeDV(table, dataFile.partition(), dataFile.location(), positions);
+    } else {
+      return writePosDeletes(table, dataFile.partition(), dataFile.location(), 1, positions);
+    }
   }
 
   private PartitionKey createPartitionKey(Table table, Record record) {
