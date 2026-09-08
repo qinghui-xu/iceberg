@@ -301,6 +301,69 @@ public class TestEqualityDeleteCacheManager extends TestBase {
     }
   }
 
+  /**
+   * Forces the interleaving where {@code close()} runs while a build is already in flight: the
+   * builder blocks (holding the {@code CacheEntry}'s monitor, since the build runs inside the
+   * synchronized {@code dataFrame()}) until the test releases it, and {@code close()} is started on
+   * another thread once the build has provably started. Because {@code close()}'s call to {@code
+   * entry.unpersist()} shares that same monitor, it cannot run until the build finishes and
+   * returns, no matter how the two threads are scheduled -- so this test deterministically covers
+   * the "build wins, then close() unpersists immediately after" ordering. We chose the contract
+   * that such an in-flight build completes and returns its DataFrame rather than throwing, since
+   * the lock structure guarantees close() cannot interrupt or preempt it; the manager still
+   * guarantees the DataFrame is unpersisted and the staging id unstaged exactly once, immediately
+   * after the build returns.
+   */
+  @Test
+  public void closeDuringInFlightBuildUnpersistsExactlyOnceAfterBuildCompletes() throws Exception {
+    CountDownLatch buildStarted = new CountDownLatch(1);
+    CountDownLatch releaseBuild = new CountDownLatch(1);
+    RecordingBuilder builder =
+        new RecordingBuilder() {
+          @Override
+          public Dataset<Row> apply(DeleteCacheKey key, String stagingId) {
+            Dataset<Row> df = super.apply(key, stagingId);
+            buildStarted.countDown();
+            try {
+              assertThat(releaseBuild.await(1, TimeUnit.MINUTES))
+                  .as("test timed out waiting to release the blocked build")
+                  .isTrue();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new RuntimeException(e);
+            }
+            return df;
+          }
+        };
+
+    // Two consumers: the key is shared, so the build persists and materializes it.
+    EqualityDeleteCacheManager manager =
+        manager(builder, ImmutableMap.of(1, ImmutableSet.of(KEY_A), 2, ImmutableSet.of(KEY_A)));
+    ExecutorService buildExecutor = Executors.newSingleThreadExecutor();
+    try {
+      Future<Dataset<Row>> buildFuture = buildExecutor.submit(() -> manager.mergedDeletes(KEY_A));
+      assertThat(buildStarted.await(1, TimeUnit.MINUTES)).isTrue();
+
+      // close() removes the entry from the outer map immediately, but entry.unpersist() must
+      // block behind the in-flight, still-blocked build's monitor.
+      Thread closer = new Thread(manager::close);
+      closer.start();
+
+      releaseBuild.countDown();
+      Dataset<Row> returned = buildFuture.get(1, TimeUnit.MINUTES);
+      closer.join(TimeUnit.MINUTES.toMillis(1));
+
+      assertThat(returned).as("the in-flight build completes and returns normally").isNotNull();
+      assertThat(returned.storageLevel())
+          .as("close() unpersisted it immediately once the build finished")
+          .isEqualTo(StorageLevel.NONE());
+      assertThat(builder.unstageCount(KEY_A)).isEqualTo(1);
+      assertThat(manager.size()).isZero();
+    } finally {
+      buildExecutor.shutdownNow();
+    }
+  }
+
   private static DeleteCacheKey key(String name) {
     DeleteFile deleteFile = mock(DeleteFile.class);
     when(deleteFile.location()).thenReturn("file:///deletes/" + name + ".parquet");

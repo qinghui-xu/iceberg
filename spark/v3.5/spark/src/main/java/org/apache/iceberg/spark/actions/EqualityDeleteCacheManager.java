@@ -163,6 +163,7 @@ class EqualityDeleteCacheManager implements Closeable {
     private final String stagingId = UUID.randomUUID().toString();
     private Dataset<Row> dataFrame = null;
     private boolean staged = false;
+    private boolean released = false;
 
     CacheEntry(DeleteCacheKey key, Set<Integer> consumers) {
       this.key = key;
@@ -172,6 +173,10 @@ class EqualityDeleteCacheManager implements Closeable {
 
     /** Builds the DataFrame on first call; persisted and materialized when shared. */
     synchronized Dataset<Row> dataFrame() {
+      Preconditions.checkState(
+          !released,
+          "Cannot load merged equality deletes for %s: cache entry has already been released",
+          key);
       if (dataFrame == null) {
         Preconditions.checkState(
             !remainingConsumers().isEmpty(),
@@ -222,7 +227,16 @@ class EqualityDeleteCacheManager implements Closeable {
       }
     }
 
+    /**
+     * Marks the entry released so a build attempted afterward through a stale reference (one
+     * fetched from the outer map before this key was removed from it) is refused with a clear error
+     * instead of staging or persisting something nothing will ever clean up. A build that is
+     * already in flight when this method is called shares this same monitor, so it always completes
+     * first; this method then unpersists and unstages it immediately.
+     */
     synchronized void unpersist() {
+      this.released = true;
+
       if (dataFrame != null && shared) {
         dataFrame.unpersist(false);
       }
