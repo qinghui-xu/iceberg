@@ -156,6 +156,12 @@ class EqualityDeleteScans {
    * <p>The scope IDs come from the plan so that both sides of a partition-scoped join agree on
    * them, and so that partitions are compared structurally rather than by their human-readable
    * path, which renders a string value of {@code "null"} and an actual {@code NULL} the same way.
+   *
+   * <p>The dataset will be coalesced to 1 partition. If we let Spark decide the number of
+   * partitions which will be min(num_files, total_executor_cores), it can be large and creating a
+   * lot of tasks, leading to high Spark scheduling delay and eventually a timeout when broadcasting
+   * it to join with data. In fact, as the collection is pretty small (as it fits into driver
+   * memory), one single task should be enough to compute the dataset.
    */
   Dataset<Row> fileAttributes(Iterable<? extends ContentFile<?>> files) {
     List<Row> rows = Lists.newArrayList();
@@ -163,7 +169,7 @@ class EqualityDeleteScans {
       rows.add(RowFactory.create(file.location(), file.dataSequenceNumber(), plan.scopeId(file)));
     }
 
-    return spark.createDataFrame(rows, FILE_ATTRIBUTES_SCHEMA);
+    return spark.createDataFrame(rows, FILE_ATTRIBUTES_SCHEMA).coalesce(1);
   }
 
   /**
