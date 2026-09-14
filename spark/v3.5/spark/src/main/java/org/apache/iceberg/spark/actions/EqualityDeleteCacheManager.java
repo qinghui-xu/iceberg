@@ -186,8 +186,17 @@ class EqualityDeleteCacheManager implements Closeable {
         Dataset<Row> merged = builder.apply(key, stagingId);
         if (shared) {
           merged = merged.persist(storageLevel);
-          // materialize before any replacement file is written so build failures surface early
-          merged.count();
+          boolean materialized = false;
+          try {
+            // materialize before any replacement file is written so build failures surface early
+            merged.count();
+            materialized = true;
+          } finally {
+            if (!materialized) {
+              // leave dataFrame unassigned so a later release does not try to unpersist again
+              merged.unpersist(false);
+            }
+          }
         }
 
         this.dataFrame = merged;

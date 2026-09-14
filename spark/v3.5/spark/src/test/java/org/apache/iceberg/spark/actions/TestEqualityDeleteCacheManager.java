@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import static org.apache.spark.sql.functions.expr;
 import static org.apache.spark.sql.functions.lit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -62,10 +63,15 @@ public class TestEqualityDeleteCacheManager extends TestBase {
 
     @Override
     public Dataset<Row> apply(DeleteCacheKey key, String stagingId) {
-      builds.computeIfAbsent(key, ignored -> new AtomicInteger()).incrementAndGet();
-      stagingIds.put(key, stagingId);
       // Spark caches by logical plan, so every key must produce a distinct plan
       Dataset<Row> df = spark.range(3).toDF().withColumn("cache_key", lit(key.locations().get(0)));
+      return record(key, stagingId, df);
+    }
+
+    /** Records a build for {@code key}; subclasses use this to swap in a different DataFrame. */
+    Dataset<Row> record(DeleteCacheKey key, String stagingId, Dataset<Row> df) {
+      builds.computeIfAbsent(key, ignored -> new AtomicInteger()).incrementAndGet();
+      stagingIds.put(key, stagingId);
       dataFrames.put(key, df);
       return df;
     }
@@ -80,6 +86,10 @@ public class TestEqualityDeleteCacheManager extends TestBase {
 
     long unstageCount(DeleteCacheKey key) {
       return unstaged.stream().filter(id -> id.equals(stagingIds.get(key))).count();
+    }
+
+    Dataset<Row> recorded(DeleteCacheKey key) {
+      return dataFrames.get(key);
     }
   }
 
@@ -263,6 +273,30 @@ public class TestEqualityDeleteCacheManager extends TestBase {
         manager(builder, ImmutableMap.of(1, ImmutableSet.of(KEY_A)))) {
       assertThatThrownBy(() -> manager.mergedDeletes(KEY_A)).hasMessage("boom");
       manager.onGroupTerminal(1);
+      assertThat(builder.unstageCount(KEY_A)).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void failedMaterializationUnpersistsImmediately() {
+    RecordingBuilder builder =
+        new RecordingBuilder() {
+          @Override
+          public Dataset<Row> apply(DeleteCacheKey key, String stagingId) {
+            Dataset<Row> failing =
+                spark.range(1).toDF().withColumn("boom", expr("raise_error('boom')"));
+            return record(key, stagingId, failing);
+          }
+        };
+
+    try (EqualityDeleteCacheManager manager =
+        manager(builder, ImmutableMap.of(1, ImmutableSet.of(KEY_A), 2, ImmutableSet.of(KEY_A)))) {
+      assertThatThrownBy(() -> manager.mergedDeletes(KEY_A)).hasMessageContaining("boom");
+      assertThat(manager.isBuilt(KEY_A)).isFalse();
+      assertThat(builder.recorded(KEY_A).storageLevel()).isEqualTo(StorageLevel.NONE());
+
+      manager.onGroupTerminal(1);
+      manager.onGroupTerminal(2);
       assertThat(builder.unstageCount(KEY_A)).isEqualTo(1);
     }
   }
