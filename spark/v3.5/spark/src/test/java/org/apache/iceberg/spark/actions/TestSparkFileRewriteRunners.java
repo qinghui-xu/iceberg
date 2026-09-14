@@ -33,6 +33,7 @@ import org.apache.iceberg.spark.TestBase;
 import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StringType;
+import org.apache.spark.storage.StorageLevel;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -91,13 +92,28 @@ public class TestSparkFileRewriteRunners extends TestBase {
   }
 
   @Test
+  public void testBinPackDataValidOptions() {
+    Table table = catalog.createTable(TABLE_IDENT, SCHEMA);
+    SparkBinPackFileRewriteRunner rewriter = new SparkBinPackFileRewriteRunner(spark, table);
+
+    assertThat(rewriter.validOptions())
+        .as("Rewriter must report all supported options")
+        .containsExactlyInAnyOrder(
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS,
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL);
+  }
+
+  @Test
   public void testSortDataValidOptions() {
     Table table = catalog.createTable(TABLE_IDENT, SCHEMA);
     SparkSortFileRewriteRunner rewriter = new SparkSortFileRewriteRunner(spark, table, SORT_ORDER);
 
     assertThat(rewriter.validOptions())
         .as("Rewriter must report all supported options")
-        .containsExactlyInAnyOrder(SparkShufflingFileRewriteRunner.SHUFFLE_PARTITIONS_PER_FILE);
+        .containsExactlyInAnyOrder(
+            SparkShufflingFileRewriteRunner.SHUFFLE_PARTITIONS_PER_FILE,
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS,
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL);
   }
 
   @Test
@@ -112,7 +128,49 @@ public class TestSparkFileRewriteRunners extends TestBase {
         .containsExactlyInAnyOrder(
             SparkZOrderFileRewriteRunner.SHUFFLE_PARTITIONS_PER_FILE,
             SparkZOrderFileRewriteRunner.MAX_OUTPUT_SIZE,
-            SparkZOrderFileRewriteRunner.VAR_LENGTH_CONTRIBUTION);
+            SparkZOrderFileRewriteRunner.VAR_LENGTH_CONTRIBUTION,
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS,
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL);
+  }
+
+  @Test
+  public void testEqualityDeleteJoinOptionDefaults() {
+    Table table = catalog.createTable(TABLE_IDENT, SCHEMA);
+    SparkBinPackFileRewriteRunner rewriter = new SparkBinPackFileRewriteRunner(spark, table);
+    rewriter.init(ImmutableMap.of());
+
+    assertThat(rewriter.eqDeleteJoinThresholdRecords())
+        .as("Join path must be disabled by default")
+        .isEqualTo(SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS_DEFAULT)
+        .isNegative();
+    assertThat(rewriter.eqDeleteJoinCacheStorageLevel()).isEqualTo(StorageLevel.MEMORY_AND_DISK());
+  }
+
+  @Test
+  public void testEqualityDeleteJoinOptionParsing() {
+    Table table = catalog.createTable(TABLE_IDENT, SCHEMA);
+    SparkBinPackFileRewriteRunner rewriter = new SparkBinPackFileRewriteRunner(spark, table);
+    rewriter.init(
+        ImmutableMap.of(
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_THRESHOLD_RECORDS, "1000",
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL, "DISK_ONLY"));
+
+    assertThat(rewriter.eqDeleteJoinThresholdRecords()).isEqualTo(1000L);
+    assertThat(rewriter.eqDeleteJoinCacheStorageLevel()).isEqualTo(StorageLevel.DISK_ONLY());
+  }
+
+  @Test
+  public void testInvalidEqualityDeleteJoinStorageLevel() {
+    Table table = catalog.createTable(TABLE_IDENT, SCHEMA);
+    SparkBinPackFileRewriteRunner rewriter = new SparkBinPackFileRewriteRunner(spark, table);
+
+    Map<String, String> invalidOptions =
+        ImmutableMap.of(
+            SparkDataFileRewriteRunner.EQ_DELETE_JOIN_CACHE_STORAGE_LEVEL, "NOT_A_LEVEL");
+    assertThatThrownBy(() -> rewriter.init(invalidOptions))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(
+            "Cannot parse 'eq-delete-join-cache-storage-level' value NOT_A_LEVEL");
   }
 
   @Test
